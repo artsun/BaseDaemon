@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
-import sys
+
 import os
+import sys
+import abc
 import time
-import atexit
 import signal
 import syslog
-import abc
 import traceback
+
 def check_pid(pid):
     """ Check For the existence of a unix pid. """
     try:
@@ -15,12 +16,11 @@ def check_pid(pid):
         return False
     else:
         return True
-def syslg(msg: str, lvl: int = 6):
-    """
-    syslog.LOG_ERR = 3, syslog.LOG_WARNING = 4, syslog.LOG_INFO = 6
-    """
-    syslog.syslog(lvl, msg)
+    
+""" syslog.LOG_ERR = 3, syslog.LOG_WARNING = 4, syslog.LOG_INFO = 6 """
+
 class BaseDaemon(object):
+    
     def __init__(self, pidfile: str, log_name: str, stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
         self.stdin = stdin
         self.stdout = stdout
@@ -28,6 +28,7 @@ class BaseDaemon(object):
         self.pidfile = pidfile
         self.log_name = log_name
         syslog.openlog(self.log_name)
+        
     def daemonize(self):
         """
         производит UNIX double-form магию,
@@ -35,14 +36,12 @@ class BaseDaemon(object):
         """
         try:
             pid = os.fork()
-            if pid > 0:
-                sys.exit(0)  # exit first parent
+            sys.exit(0) if pid > 0 else None  # exit first parent
         except OSError as e:
             msg = f"(UNIX)fork #1 был неудачным: {e.errno} ({e.strerror})\n"
-            syslg(msg, 3)
-            sys.exit(msg)
-        # decouple from parent environment
-        os.chdir("/")
+            syslog.syslog(3, msg)
+            raise SystemExit(msg)
+        os.chdir("/")  # decouple from parent environment
         os.setsid()
         os.umask(0)
         try:
@@ -51,74 +50,74 @@ class BaseDaemon(object):
                 sys.exit(0)  # exit from second parent
         except OSError as e:
             msg = f"(UNIX)fork #2 был неудачным: {e.errno} ({e.strerror})\n"
-            syslg(msg, 3)
+            syslog.syslog(3, msg)
             sys.exit(msg)
-        syslg(f'Pid файл {self.pidfile} записан')  # redirect standard file descriptors and write pidfile
-        atexit.register(self.delpid)
+        # redirect standard file descriptors and write pidfile
         signal.signal(signal.SIGTERM, self.delpid)
         signal.signal(signal.SIGINT, self.delpid)
         pid = str(os.getpid())
-        syslg(f'Pid процесса: {pid}')
         with open(self.pidfile, 'w+') as pid_file:
             pid_file.write(f"{pid}\n")
-    def delpid(self, *args, **kwargs):  # для atexit.register следует оставлять *args, **kwargs
+    STRSIGNAL = lambda self, n: {9: 'SIGKILL', 15: 'SIGTERM', 2: 'SIGINT'}.get(n, n)
+    
+    def delpid(self, signum, frame):
+        syslog.syslog(6, f'завершение, сигнал {self.STRSIGNAL(signum)}')
         if os.path.exists(self.pidfile):
             os.remove(self.pidfile)
-            syslog.syslog(syslog.LOG_INFO, 'Демон остановлен. Pid файл удален...')
+            syslog.syslog(6, 'Pid файл удален...')
+        raise SystemExit()
+        
     def start(self):
-        syslg('*' * 100)
-        syslg(f'Инициализация демонизации процесса {self.log_name}')
+        syslog.syslog(6, '*' * 100)
+        syslog.syslog(6, f'Инициализация процесса {self.log_name}')
         try:  # Check for a pidfile to see if the daemon already runs
             with open(self.pidfile, 'r') as pid_file:
                 pid = int(pid_file.read().strip())
         except IOError:
             pid = None
         if pid is not None and check_pid(pid):
-            msg = f'pid файл ({self.pidfile}) уже существует и процесс демона уже запущен\n'
-            syslg(msg)
-            sys.stderr.write(msg)
-            sys.exit(1)
-        syslg('Запускаем процесс демонизации.')  # Start the daemon
+            msg = f'pid файл ({self.pidfile}) уже существует и процесс демона запущен\n'
+            syslog.syslog(6, msg)
+            raise SystemExit(msg)
         self.daemonize()
         try:
             self.run()
+        except SystemExit:
+            syslog.syslog(6, 'завершение работы')
+            syslog.closelog()
         except BaseException as err:
-            syslg('Произошла ошибка при вызове функции run демона. Traceback:', 3)
-            syslg('-' * 100, 3)
+            syslog.syslog(3, 'Произошла ошибка при вызове функции run демона. Traceback:')
+            syslog.syslog(3, '-' * 100)
             ex_type, ex, tb = sys.exc_info()
             for obj in traceback.extract_tb(tb):
-                syslg(f'Файл: {obj[0]}, строка: {obj[1]}, вызов: {obj[2]}', 3)
-                syslg(f'----->>>  {obj[3]}', 3)
-            syslg(f'Ошибка: {err}.', 3)
-            syslg('-' * 100, 3)
+                syslog.syslog(3, f'Файл: {obj[0]}, строка: {obj[1]}, вызов: {obj[2]}')
+                syslog.syslog(3, f'----->>>  {obj[3]}')
+                syslog.syslog(3, f'Ошибка: {err}.')
+            syslog.syslog(3, '-' * 100)
+            
     def stop(self):
         try:  # Get the pid from the pidfile
             with open(self.pidfile, 'r') as pid_file:
                 pid = int(pid_file.read().strip())
         except IOError:
             pid = None
-        if not pid:
+        if pid is None:
             msg = f"Pid файл ({self.pidfile} не найден). Возможно демон не запущен?\n"
-            syslg(msg, 3)
-            sys.stderr.write(msg)
-            return  # not an error in a restart
-        num = 0  # Try killing the daemon process
-        try:
-            while 1:
+            syslog.syslog(3, msg)
+            raise SystemExit(msg)
+        num = 0
+        while True:
+            try:
                 os.kill(pid, signal.SIGTERM)
-                time.sleep(0.1)
+                break
+            except OSError as er:
                 num += 1
-                if num == 50:  # 5 секунд (принято для linux)
-                    os.kill(pid, signal.SIGKILL)
-                    syslg('процесс не завершается, выполняется SIGKILL', 4)
-        except OSError:
-                if os.path.exists(self.pidfile):
-                    os.remove(self.pidfile)
-        syslg('завершение работы')
-        syslog.closelog()
-    def restart(self):
-        syslg('Перезапускаем процесс демонизации')
-        self.stop()
-        self.start()
+                syslog.syslog(3, f'ошибка при выполнении SIGTERM: {str(er)}')
+                os.kill(pid, signal.SIGKILL) if num == 5 else None
+            time.sleep(1)
+            
     @abc.abstractmethod
     def run(self):
+        """
+        inherited
+        """
